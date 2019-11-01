@@ -1,27 +1,10 @@
 """Wavenumber and frequency spectrum S(K,f) estimation based on Beall(1982)"""
 import numpy as np              # for linspace construction
-import numba                    # for optimized for loops
-import xarray                   # for data container construction
-import xarray_dsp as dsp        # for spectrogram
+import xarray as xr             # for data container construction
 
 
-@numba.jit
-def average_close_K(S, K_l, K):
-    """Return S_K_f[k,j] = average over i: S[j,i] if K_l[j,i] close to K[k] else 0"""
-    Nf, Nt = S.shape            # same as K_l
-    NK = K.shape[0]
-    bin_half_width = (K[1] - K[0]) / 2.0
-    S_K_f = np.zeros((NK, Nf))
-    for j in range(Nf):
-        for k in range(NK):
-            for i in range(Nt):
-                if abs(K_l[j,i] - K[k]) < bin_half_width:
-                    S_K_f[k,j] += S[j,i]
-            S_K_f[k,j] /= Nt
-    return S_K_f
-
-
-def beall(S, H, Dx, NK):
+def beall(S, H, Dx, NK, chunks={'frequency': 1}, avg_dim='time',
+          wavenumber_dim='wavenumber'):
     """Beall (1982) method of S(K,f) estimation from 2-point measurements
 
     Estimates the local wavenumber K and frequency f spectrum S(K,f)
@@ -38,23 +21,39 @@ def beall(S, H, Dx, NK):
         distance between the 2 measurement points
     NK : int
         requested number of points in local wavenumber dimension
+    chunks : dict, optional
+        argument to :py:meth:`xarray.DataArray.chunk` to distribute
+        broadcasted K-f computation
+    avg_dim : str, optional
+        dimension over which to average over with mean. If None,
+        no averaging is done and is left to the user.
+    wavenumber_dim : str, optional
+        name of the wavenumber dimension
 
     Returns
     -------
     S_K_f : xarray.DataArray, (NK, Nf) -> ('wavenumber', 'frequency')
-        calculated S(K, f) spectrum
+        S(K, f) spectrum, wrapping dask array (uncomputed)
+        if avg_dim is None, will also contain the 'time' dimension
     """
     K_max = np.pi / Dx  # Nyquist-like maximum unambiguously resolvable wavenumber
     K, DK = np.linspace(-K_max, K_max, NK, retstep=True)  # wavenumber range
+    K = xr.DataArray(K, coords=[(wavenumber_dim, K)], name=wavenumber_dim)
     # local wavenumber approximated by central phase differentiation
-    K_l = np.angle(H) / Dx        # cross-phase over distance
-    K_l = np.clip(K_l, -K_max, K_max)             # remove ambiguous wavenumbers
-    S_K_f = average_close_K(S.values, K_l, K)     # spectrum averaging in bin selection
-    S_K_f = xarray.DataArray(S_K_f, coords=[('wavenumber', K), ('frequency', S.frequency)])
-    return S_K_f
+    K_l = xr.apply_ufunc(np.angle, H) / Dx  # cross-phase over distance
+    # chunk to a Dask array
+    K_ld = K_l.chunk(chunks)
+    in_bin = np.abs(K_ld - K) < DK/2
+    S_K_f_toavg = S.where(in_bin)
+    if avg_dim is None:
+        return S_K_f_toavg
+    else:
+        S_K_f = S_K_f_toavg.mean(dim=avg_dim)
+        return S_K_f
 
 
-def beall_fft(sig1, sig2, Dx, NK, **spectral_kw):
+def beall_fft(sig1, sig2, Dx, NK, chunks={'frequency': 1}, avg_dim='time',
+              wavenumber_dim='wavenumber', **spectral_kw):
     """Wrapper around :func:`beall` which uses FFT for spectra estimation
 
     Parameters
@@ -67,8 +66,16 @@ def beall_fft(sig1, sig2, Dx, NK, **spectral_kw):
         distance between the 2 measurement points
     NK : int
         requested number of points in local wavenumber dimension
+    chunks : dict, optional
+        argument to :py:meth:`xarray.DataArray.chunk` to distribute
+        broadcasted K-f computation
+    avg_dim : str, optional
+        dimension over which to average over with mean. If None,
+        no averaging is done and is left to the user.
+    wavenumber_dim : str, optional
+        name of the wavenumber dimension
     spectral_kw : keyword arguments, optional
-        extra keyword arguments will passed on to :func:`xarray_dsp.spectrogram`
+        extra keyword arguments will passed on to :py:func:`xarray_dsp.spectrogram`
         by default noverlap=0 to be consistent with Beall (1982)
         seglen=1/f_res may be of interest
 
@@ -81,6 +88,7 @@ def beall_fft(sig1, sig2, Dx, NK, **spectral_kw):
         S2 : spectrogram of sig2
         H : cross-spectrogram of sig1 and sig2
     """
+    import xrscipy.signal as dsp
     spectral_kw = spectral_kw.copy()  # will modify copy
     spectral_kw.setdefault('noverlap', 0)  # to be consistent with Beall
     # ansamble spectra
@@ -88,16 +96,49 @@ def beall_fft(sig1, sig2, Dx, NK, **spectral_kw):
     S = 0.5 * (S1 + S2)         # average ansamble spectra
     # cross spectra ansamble
     H = dsp.crossspectrogram(sig1, sig2, **spectral_kw)
-    S_K_f = beall(S, H, Dx, NK)
-    ds = xarray.Dataset({'S_K_f': S_K_f, 'S_f': S.mean(dim='time'),
+    S_K_f = beall(S, H, Dx, NK, chunks, avg_dim, wavenumber_dim)
+    ds = xr.Dataset({'S_K_f': S_K_f, 'S': S,
                          'S1': S1, 'S2': S2, 'H': H})
     return ds
 
 
-def statistical_dispersion_relation(beall_ds):
-    s_K_f = beall_ds.S_K_f / beall_ds.S_f  # conditional spectrum
-    K = s_K_f.wavenumber
-    K_mean = (K * s_K_f).sum(dim='wavenumber')
-    K_std = np.sqrt( ( (K - K_mean)**2 * s_K_f ).sum(dim='wavenumber') )
-    ds = xarray.Dataset({'s_K_f': s_K_f, 'K_mean': K_mean, 'K_std': K_std})
+def statistical_dispersion_relation(S_K_f, S_f, wavenumber_dim='wavenumber'):
+    r"""Estimate the statistical dispersion relation
+
+
+    Calculates the mean and standard deviation of the wavenumber with respect
+    to the other dimensions as
+
+    .. math::
+
+        s(K, f) = S(K, f) / S(f)
+        \bar{K} = \int s(K,f) \cdot K dK
+        \mathrm{sd}(K) = \sqrt{\int s(K,f) \cdot (K - \bar{K})^2  dK}
+
+
+    Parameters
+    ----------
+    S_K_f : xarray.DataArray
+        estimated S(K, f; ...) wavenumber-frequency spectrum
+        must contain *wavenumber_dim* dimension
+        other dimensions (frequency, time if not fully averaged)
+        must broadcast with *S_f*
+    S_f : xarray.DataArray
+        frequency spectrum
+        must broadcast with *S_K_f*
+    wavenumber_dim : str, optional
+        name of the wavenumber dimension in *S_K_f*
+
+    Returns
+    -------
+    ds : xarray.Dataset
+        s_K_f : conditional spectrum
+        K_mean : mean K
+        K_std : std. deviation about K_mean
+    """
+    s_K_f = S_K_f / S_f  # conditional spectrum
+    K = s_K_f.coords[wavenumber_dim]
+    K_mean = (K * s_K_f).sum(dim=wavenumber_dim)
+    K_std = np.sqrt( ( (K - K_mean)**2 * s_K_f ).sum(dim=wavenumber_dim) )
+    ds = xr.Dataset({'s_K_f': s_K_f, 'K_mean': K_mean, 'K_std': K_std})
     return ds

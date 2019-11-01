@@ -13,5 +13,5 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/smartass101/xrbeall",
     py_modules=['xrbeall'],
-    install_requires=['xarray', 'xarray-dsp', 'numba'],
+    install_requires=['xarray', 'xrscipy'],
 )
